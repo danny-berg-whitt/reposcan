@@ -1,0 +1,64 @@
+# Automated security scan (manual trigger). Produces artifacts you can download and share.
+# - Checkout with full history (fetch-depth: 0) so scanners detect historical leaks
+# - Runs gitleaks (Docker), detect-secrets, truffleHog, and ripgrep
+# - Uploads results as an artifact named 'security-scan-reports'
+name: repo-security-scan
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep python3-pip docker.io
+          pip3 install detect-secrets truffleHog
+
+      - name: Run gitleaks (Docker)
+        run: |
+          # gitleaks will scan working tree and history when checkout fetched full history
+          docker run --rm -v "${{ github.workspace }}":/repo zricethezav/gitleaks:latest detect --source=/repo --report-path=/repo/gitleaks-report.json || true
+
+      - name: Run detect-secrets (Yelp)
+        run: |
+          detect-secrets scan --all-files > .secrets.baseline || true
+
+      - name: Run truffleHog (filesystem)
+        run: |
+          trufflehog filesystem --directory "${{ github.workspace }}" --json > trufflehog-report.json || true
+
+      - name: Keyword scan with ripgrep
+        run: |
+          rg -n --hidden --no-ignore-vcs -S "(password|passwd|pwd|secret|api[_-]?key|apikey|token|auth|access[_-]?key|aws|BEGIN RSA PRIVATE KEY|-----BEGIN PRIVATE KEY-----|google-services|GoogleService-Info|client_secret|firebase|keystore|\.p12|\.jks|.pem|.key)" . > rg-findings.txt || true
+
+      - name: Collect git object / largest blobs info
+        run: |
+          git rev-list --objects --all > all_objs.txt || true
+          git gc --aggressive --prune=now || true
+          if [ -f .git/objects/pack/pack-*.idx ]; then
+            git verify-pack -v .git/objects/pack/pack-*.idx 2>/dev/null | sort -k3 -n | tail -n 50 > largest-blobs.txt || true
+          else
+            echo "No pack file found; skipping largest-blobs.txt" > largest-blobs.txt
+          fi
+
+      - name: Upload scan reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-scan-reports
+          path: |
+            gitleaks-report.json
+            .secrets.baseline
+            trufflehog-report.json
+            rg-findings.txt
+            all_objs.txt
+            largest-blobs.txt
